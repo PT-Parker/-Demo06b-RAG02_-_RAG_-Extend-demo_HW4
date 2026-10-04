@@ -7,3 +7,6 @@ __pycache__/
 .vscode/
 faiss_db*
 .streamlit/
+.env
+.env.*
+!.env.example

@@ -1,5 +1,6 @@
 """
 簡易台股 RAG 後端，從 Demo06b notebook 重構而來。
+支援離線詞彙檢索與向量檢索，回傳答案及來源片段。
 
 功能：
 - 載入本地 Markdown 知識庫，分割成 chunk 並建立 FAISS 向量索引。
@@ -9,27 +10,29 @@
 環境變數：
 - TW_STOCK_CORPUS_DIR：自訂知識庫路徑，預設 data/tw_stock_corpus。
 - RAG_TOP_K：檢索數量，預設 4。
-- GROQ_API_KEY / OPENAI_API_KEY：呼叫 LLM 用，未提供時改用檢索摘要回應。
+- GROQ_API_KEY / OPENAI_API_KEY：呼叫 LLM 用，未提供時列出檢索原文片段。
 - RAG_LLM_MODEL：LLM 名稱，預設 groq:openai/gpt-oss-120b。
 - RAG_OPENAI_BASE_URL：OpenAI 相容端點，Groq 預設 https://api.groq.com/openai/v1。
 """
 
 from __future__ import annotations
 
-import logging
 import os
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from langchain_core.documents import Document
+if TYPE_CHECKING:
+    from langchain_core.documents import Document
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain_community.vectorstores import FAISS
+
 try:
-    # langchain >=0.2 拆分為獨立套件
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:  # pragma: no cover - 舊版相容
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+    from .evidence import evidence_response
+    from .llm_clients import call_llm
+except ImportError:
+    from evidence import evidence_response
+    from llm_clients import call_llm
 
 # 參數與預設值
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -41,35 +44,21 @@ SYSTEM_PROMPT = (
 DEFAULT_MODEL = "groq:openai/gpt-oss-120b"
 
 
-class EmbeddingGemmaEmbeddings(HuggingFaceEmbeddings):
-    """沿用 Demo06b 的 embedding 前綴，保持檢索表現。"""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(
-            model_name="google/embeddinggemma-300m",
-            encode_kwargs={"normalize_embeddings": True},
-            **kwargs,
-        )
-
-    def embed_documents(self, texts: List[str]) -> List[List[float]]:
-        decorated = [f"title: none | text: {t}" for t in texts]
-        return super().embed_documents(decorated)
-
-    def embed_query(self, text: str) -> List[float]:
-        return super().embed_query(f"task: search result | query: {text}")
-
-
 def _resolve_corpus_dir(corpus_dir: Optional[str] = None) -> Path:
     return Path(corpus_dir or os.getenv("TW_STOCK_CORPUS_DIR", DEFAULT_CORPUS_DIR)).resolve()
 
 
 def load_corpus(corpus_dir: Optional[str] = None) -> List[Document]:
     """讀取 corpus 目錄並切成 chunk，附上來源檔名以供引用。"""
+    from langchain_core.documents import Document
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
     target_dir = _resolve_corpus_dir(corpus_dir)
     splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=120)
     docs: List[Document] = []
 
     for path in sorted(target_dir.glob("*.md")):
+        if path.name.lower() == "readme.md":
+            continue
         text = path.read_text(encoding="utf-8")
         for idx, chunk in enumerate(splitter.split_text(text)):
             docs.append(
@@ -87,6 +76,20 @@ def load_corpus(corpus_dir: Optional[str] = None) -> List[Document]:
 
 def _build_embedding_model() -> HuggingFaceEmbeddings:
     """優先使用 Demo06b 的 Gemma embedding，缺 token 時退回 MiniLM。"""
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    import logging
+
+    class EmbeddingGemmaEmbeddings(HuggingFaceEmbeddings):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(model_name="google/embeddinggemma-300m",
+                             encode_kwargs={"normalize_embeddings": True}, **kwargs)
+
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            return super().embed_documents([f"title: none | text: {t}" for t in texts])
+
+        def embed_query(self, text: str) -> List[float]:
+            return super().embed_query(f"task: search result | query: {text}")
+
     hf_token = os.getenv("HUGGINGFACEHUB_API_TOKEN")
     try:
         kwargs = {}
@@ -99,6 +102,7 @@ def _build_embedding_model() -> HuggingFaceEmbeddings:
 
 
 def build_vector_store(docs: List[Document]) -> FAISS:
+    from langchain_community.vectorstores import FAISS
     embeddings = _build_embedding_model()
     return FAISS.from_documents(docs, embeddings)
 
@@ -108,25 +112,35 @@ def get_retriever(vs: FAISS, top_k: int = 5):
 
 
 @lru_cache(maxsize=1)
-def _lazy_vector_store() -> FAISS:
-    docs = load_corpus()
+def _lazy_vector_store(corpus_dir: str) -> FAISS:
+    docs = load_corpus(corpus_dir)
     return build_vector_store(docs)
 
 
 def _ensure_retriever(top_k: Optional[int] = None):
-    vs = _lazy_vector_store()
-    k = top_k or int(os.getenv("RAG_TOP_K", "4"))
+    vs = _lazy_vector_store(str(_resolve_corpus_dir()))
+    k = top_k if top_k is not None else _retrieval_k()
     return vs, get_retriever(vs, k)
+
+
+def _retrieval_k() -> int:
+    try:
+        k = int(os.getenv("RAG_TOP_K", "4"))
+    except ValueError as exc:
+        raise ValueError("RAG_TOP_K 必須為 1 到 10 的整數。") from exc
+    if not 1 <= k <= 10:
+        raise ValueError("RAG_TOP_K 必須為 1 到 10 的整數。")
+    return k
 
 
 def _retrieve_docs(retriever: Any, query: str) -> List[Document]:
     """兼容新版 Retriever 介面（invoke）與舊版 get_relevant_documents。"""
-    if hasattr(retriever, "get_relevant_documents"):
-        return retriever.get_relevant_documents(query)
-    if hasattr(retriever, "invoke"):
+    if callable(getattr(retriever, "invoke", None)):
         result = retriever.invoke(query)
         if isinstance(result, list):
             return result
+    if callable(getattr(retriever, "get_relevant_documents", None)):
+        return retriever.get_relevant_documents(query)
     raise AttributeError("retriever 物件缺少檢索方法")
 
 
@@ -149,58 +163,32 @@ def _format_history(history: Optional[List[Dict[str, str]]]) -> str:
     return "\n".join(pairs)
 
 
-def _call_llm(prompt: str) -> str:
-    # 1) 優先走 Gemini
-    gemini_key = os.getenv("GEMINI_API_KEY")
-    gemini_model = os.getenv("RAG_LLM_MODEL", "gemini-1.5-flash")
-    if gemini_key:
+def _call_llm(prompt: str, gemini_api_key: Optional[str] = None,
+              gemini_model: Optional[str] = None) -> Optional[str]:
+    return call_llm(prompt, gemini_api_key=gemini_api_key, gemini_model=gemini_model)
+
+
+def rag_answer(query: str, history: Optional[List[Dict[str, str]]] = None,
+               retrieval_mode: str = "vector", gemini_api_key: Optional[str] = None,
+               gemini_model: Optional[str] = None) -> Dict[str, Any]:
+    """傳回答案與來源。offline 使用詞彙檢索且不呼叫 LLM。"""
+    if not query.strip():
+        raise ValueError("問題不可空白。")
+    if retrieval_mode == "offline":
         try:
-            import google.generativeai as genai  # type: ignore
-
-            genai.configure(api_key=gemini_key)
-            model = genai.GenerativeModel(gemini_model)
-            resp = model.generate_content(prompt)
-            if hasattr(resp, "text") and resp.text:
-                return resp.text
-        except Exception as exc:  # pragma: no cover
-            logging.warning("Gemini 呼叫失敗，嘗試其他路徑：%s", exc)
-
-    # 2) 退回 OpenAI 相容端點（如 Groq/OpenRouter）
-    api_key = os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")
-    model = os.getenv("RAG_LLM_MODEL", DEFAULT_MODEL)
-    base_url = os.getenv("RAG_OPENAI_BASE_URL", "https://api.groq.com/openai/v1")
-    if api_key:
-        try:
-            import aisuite as ai  # type: ignore
-
-            client = ai.Client(api_key=api_key, base_url=base_url)
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-            )
-            return resp.choices[0].message.content
-        except Exception as exc:  # pragma: no cover
-            logging.warning("OpenAI 相容端點呼叫失敗，改用檢索摘要：%s", exc)
-
-    return "目前無法連線至 LLM，以下為根據檢索片段彙整的摘要：\n" + prompt[:1200]
-
-
-def rag_answer(query: str, history: Optional[List[Dict[str, str]]] = None) -> Dict[str, Any]:
-    """傳回答案、引用來源與檢索片段。"""
-    vs, retriever = _ensure_retriever()
+            from .offline_demo import answer
+        except ImportError:
+            from offline_demo import answer
+        return answer(query, _resolve_corpus_dir(), top_k=_retrieval_k())
+    if retrieval_mode != "vector":
+        raise ValueError("retrieval_mode 必須為 offline 或 vector。")
+    _, retriever = _ensure_retriever(_retrieval_k())
     docs = _retrieve_docs(retriever, query)
 
     if not docs:
-        fallback = "知識庫未找到相關內容，請嘗試調整關鍵字或查閱公開資訊觀測站。"
-        return {
-            "question": query,
-            "answer": fallback,
-            "citations": [],
-            "retrieved_chunks": [],
-        }
+        result = evidence_response(query, [])
+        result["retrieval_mode"] = "vector"
+        return result
 
     context_block = _format_context(docs)
     prompt = (
@@ -209,27 +197,9 @@ def rag_answer(query: str, history: Optional[List[Dict[str, str]]] = None) -> Di
         f"以下是檢索到的資料片段，請整理重點回答並標註引用編號：\n{context_block}\n\n"
         "回覆格式：先給出中文答案，最後列出參考來源的編號與檔名。"
     )
-    answer = _call_llm(prompt).strip()
-
-    citations = [
-        {"id": idx, "source": doc.metadata.get("source", "unknown"), "snippet": doc.page_content}
-        for idx, doc in enumerate(docs, start=1)
-    ]
-    retrieved = [
-        {"source": doc.metadata.get("source", "unknown"), "chunk_id": doc.metadata.get("chunk_id"), "text": doc.page_content}
-        for doc in docs
-    ]
-
-    if "參考來源" not in answer:
-        cite_text = "\n".join([f"[{c['id']}] {c['source']}" for c in citations])
-        answer = f"{answer}\n\n參考來源：\n{cite_text}"
-
-    return {
-        "question": query,
-        "answer": answer,
-        "citations": citations,
-        "retrieved_chunks": retrieved,
-    }
+    result = evidence_response(query, docs, _call_llm(prompt, gemini_api_key, gemini_model))
+    result["retrieval_mode"] = "vector"
+    return result
 
 
 if __name__ == "__main__":  # 簡易手動測試
